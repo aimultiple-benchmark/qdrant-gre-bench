@@ -215,38 +215,32 @@ impl UpdateHandler {
         let scroll_read_lock = self.scroll_read_lock.clone();
         let update_tracker = self.update_tracker.clone();
         let collection_name = self.collection_name.clone();
-        self.update_worker = Some(self.runtime_handle.spawn_blocking(move || {
-            Self::update_worker_fn(
-                collection_name,
-                update_receiver,
-                tx,
-                wal,
-                segments,
-                scroll_read_lock,
-                update_tracker,
-            )
-        }));
+        self.update_worker = Some(self.runtime_handle.spawn(Self::update_worker_fn(
+            collection_name,
+            update_receiver,
+            tx,
+            wal,
+            segments,
+            scroll_read_lock,
+            update_tracker,
+        )));
 
         let segments = self.segments.clone();
         let wal = self.wal.clone();
         let wal_keep_from = self.wal_keep_from.clone();
         let clocks = self.clocks.clone();
         let flush_interval_sec = self.flush_interval_sec;
-        let runtime_handle = self.runtime_handle.clone();
         let shard_path = self.shard_path.clone();
         let (flush_tx, flush_rx) = oneshot::channel();
-        self.flush_worker = Some(self.runtime_handle.spawn_blocking(move || {
-            Self::flush_worker_fn(
-                segments,
-                wal,
-                wal_keep_from,
-                clocks,
-                flush_interval_sec,
-                runtime_handle,
-                flush_rx,
-                shard_path,
-            )
-        }));
+        self.flush_worker = Some(self.runtime_handle.spawn(Self::flush_worker_fn(
+            segments,
+            wal,
+            wal_keep_from,
+            clocks,
+            flush_interval_sec,
+            flush_rx,
+            shard_path,
+        )));
 
         self.flush_stop = Some(flush_tx);
     }
@@ -760,7 +754,51 @@ impl UpdateHandler {
         }
     }
 
-    fn update_worker_fn(
+    #[allow(clippy::too_many_arguments)]
+    fn update_worker_internal(
+        collection_name: CollectionId,
+        operation: CollectionUpdateOperations,
+        op_num: SeqNumberType,
+        wait: bool,
+        wal: LockedWal,
+        segments: LockedSegmentHolder,
+        update_operation_lock: Arc<tokio::sync::RwLock<()>>,
+        update_tracker: UpdateTracker,
+        hw_measurements: HwMeasurementAcc,
+    ) -> CollectionResult<usize> {
+        // If wait flag is set, explicitly flush WAL first
+        if wait {
+            wal.blocking_lock().flush().map_err(|err| {
+                CollectionError::service_error(format!(
+                    "Can't flush WAL before operation {op_num} - {err}"
+                ))
+            })?;
+        }
+
+        let start_time = Instant::now();
+
+        // This represents the operation without vectors and payloads for logging purposes
+        // Do not use for anything else
+        let loggable_operation = operation.remove_details();
+
+        let result = CollectionUpdater::update(
+            &segments,
+            op_num,
+            operation,
+            update_operation_lock.clone(),
+            update_tracker.clone(),
+            &hw_measurements.get_counter_cell(),
+        );
+
+        let duration = start_time.elapsed();
+
+        log_request_to_collector(&collection_name, duration, move || loggable_operation);
+
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_worker_fn(
         collection_name: CollectionId,
         mut receiver: Receiver<UpdateSignal>,
         optimize_sender: Sender<OptimizerSignal>,
@@ -769,7 +807,7 @@ impl UpdateHandler {
         update_operation_lock: Arc<tokio::sync::RwLock<()>>,
         update_tracker: UpdateTracker,
     ) {
-        while let Some(signal) = receiver.blocking_recv() {
+        while let Some(signal) = receiver.recv().await {
             match signal {
                 UpdateSignal::Operation(OperationData {
                     op_num,
@@ -778,47 +816,35 @@ impl UpdateHandler {
                     wait,
                     hw_measurements,
                 }) => {
-                    let flush_res = if wait {
-                        wal.blocking_lock().flush().map_err(|err| {
-                            CollectionError::service_error(format!(
-                                "Can't flush WAL before operation {op_num} - {err}"
-                            ))
-                        })
-                    } else {
-                        Ok(())
-                    };
+                    let collection_name_clone = collection_name.clone();
+                    let wal_clone = wal.clone();
+                    let segments_clone = segments.clone();
+                    let update_operation_lock_clone = update_operation_lock.clone();
+                    let update_tracker_clone = update_tracker.clone();
 
-                    let operation_result = flush_res.and_then(|_| {
-                        let start_time = Instant::now();
-
-                        // This represents the operation without vectors and payloads for logging purposes
-                        // Do not use for anything else
-                        let loggable_operation = operation.remove_details();
-
-                        let result = CollectionUpdater::update(
-                            &segments,
-                            op_num,
+                    let operation_result = tokio::task::spawn_blocking(move || {
+                        Self::update_worker_internal(
+                            collection_name_clone,
                             operation,
-                            update_operation_lock.clone(),
-                            update_tracker.clone(),
-                            &hw_measurements.get_counter_cell(),
-                        );
-
-                        let duration = start_time.elapsed();
-
-                        log_request_to_collector(&collection_name, duration, move || {
-                            loggable_operation
-                        });
-
-                        result
-                    });
+                            op_num,
+                            wait,
+                            wal_clone,
+                            segments_clone,
+                            update_operation_lock_clone,
+                            update_tracker_clone,
+                            hw_measurements,
+                        )
+                    })
+                    .await;
 
                     let res = match operation_result {
-                        Ok(update_res) => optimize_sender
-                            .blocking_send(OptimizerSignal::Operation(op_num))
+                        Ok(Ok(update_res)) => optimize_sender
+                            .send(OptimizerSignal::Operation(op_num))
+                            .await
                             .and(Ok(update_res))
                             .map_err(|send_err| send_err.into()),
-                        Err(err) => Err(err),
+                        Ok(Err(err)) => Err(err),
+                        Err(err) => Err(CollectionError::from(err)),
                     };
 
                     if let Some(feedback) = sender {
@@ -829,12 +855,14 @@ impl UpdateHandler {
                 }
                 UpdateSignal::Stop => {
                     optimize_sender
-                        .blocking_send(OptimizerSignal::Stop)
+                        .send(OptimizerSignal::Stop)
+                        .await
                         .unwrap_or_else(|_| log::debug!("Optimizer already stopped"));
                     break;
                 }
                 UpdateSignal::Nop => optimize_sender
-                    .blocking_send(OptimizerSignal::Nop)
+                    .send(OptimizerSignal::Nop)
+                    .await
                     .unwrap_or_else(|_| {
                         log::info!(
                             "Can't notify optimizers, assume process is dead. Restart is required"
@@ -849,94 +877,120 @@ impl UpdateHandler {
         }
         // Transmitter was destroyed
         optimize_sender
-            .blocking_send(OptimizerSignal::Stop)
+            .send(OptimizerSignal::Stop)
+            .await
             .unwrap_or_else(|_| log::debug!("Optimizer already stopped"));
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn flush_worker_fn(
+    fn flush_worker_internal(
+        segments: LockedSegmentHolder,
+        wal: LockedWal,
+        wal_keep_from: Arc<AtomicU64>,
+        clocks: LocalShardClocks,
+        shard_path: PathBuf,
+    ) {
+        log::trace!("Attempting flushing");
+        let wal_flush_job = wal.blocking_lock().flush_async();
+
+        let wal_flush_res = match wal_flush_job.join() {
+            Ok(Ok(())) => Ok(()),
+
+            Ok(Err(err)) => Err(WalError::WriteWalError(format!(
+                "failed to flush WAL: {err}"
+            ))),
+
+            Err(panic) => {
+                let message = panic::downcast_str(&panic).unwrap_or("");
+                let separator = if !message.is_empty() { ": " } else { "" };
+                Err(WalError::WriteWalError(format!(
+                    "failed to flush WAL: flush task panicked{separator}{message}"
+                )))
+            }
+        };
+
+        if let Err(err) = wal_flush_res {
+            log::error!("{err}");
+            segments.write().report_optimizer_error(err);
+            return;
+        }
+
+        let confirmed_version = Self::flush_segments(segments.clone());
+        let confirmed_version = match confirmed_version {
+            Ok(version) => version,
+            Err(err) => {
+                log::error!("Failed to flush: {err}");
+                segments.write().report_optimizer_error(err);
+                return;
+            }
+        };
+
+        // Acknowledge confirmed version in WAL, but don't acknowledge the specified
+        // `keep_from` index or higher.
+        // This is to prevent truncating WAL entries that other bits of code still depend on
+        // such as the queue proxy shard.
+        // Default keep_from is `u64::MAX` to allow acknowledging all confirmed.
+        let keep_from = wal_keep_from.load(std::sync::atomic::Ordering::Relaxed);
+
+        // If we should keep the first message, do not acknowledge at all
+        if keep_from == 0 {
+            return;
+        }
+
+        let ack = confirmed_version.min(keep_from.saturating_sub(1));
+
+        if let Err(err) = clocks.store_if_changed(&shard_path) {
+            log::warn!("Failed to store clock maps to disk: {err}");
+            segments.write().report_optimizer_error(err);
+        }
+
+        if let Err(err) = wal.blocking_lock().ack(ack) {
+            log::warn!("Failed to acknowledge WAL version: {err}");
+            segments.write().report_optimizer_error(err);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_worker_fn(
         segments: LockedSegmentHolder,
         wal: LockedWal,
         wal_keep_from: Arc<AtomicU64>,
         clocks: LocalShardClocks,
         flush_interval_sec: u64,
-        runtime: tokio::runtime::Handle,
         mut stop_receiver: oneshot::Receiver<()>,
         shard_path: PathBuf,
     ) {
         loop {
-            // Stop flush worker on signal or if sender was dropped
-            // Even if timer did not finish
-            let stop = runtime.block_on(async {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(flush_interval_sec)) => false,
-                    _ = &mut stop_receiver => true,
-                }
+            tokio::select! {
+                biased;
+                // Stop flush worker on signal or if sender was dropped
+                _ = &mut stop_receiver => {
+                    log::debug!("Stopping flush worker for shard {}", shard_path.display());
+                    return;
+                },
+                // Flush at the configured flush interval
+                _ = tokio::time::sleep(Duration::from_secs(flush_interval_sec)) => {},
+            };
+
+            let segments_clone = segments.clone();
+            let wal_clone = wal.clone();
+            let wal_keep_from_clone = wal_keep_from.clone();
+            let clocks_clone = clocks.clone();
+            let shard_path_clone = shard_path.clone();
+
+            tokio::task::spawn_blocking(move || {
+                Self::flush_worker_internal(
+                    segments_clone,
+                    wal_clone,
+                    wal_keep_from_clone,
+                    clocks_clone,
+                    shard_path_clone,
+                )
+            })
+            .await
+            .unwrap_or_else(|error| {
+                log::error!("Flush worker failed: {error}",);
             });
-
-            if stop {
-                log::debug!("Stopping flush worker for shard {}", shard_path.display());
-                return;
-            }
-
-            log::trace!("Attempting flushing");
-            let wal_flush_job = wal.blocking_lock().flush_async();
-
-            let wal_flush_res = match wal_flush_job.join() {
-                Ok(Ok(())) => Ok(()),
-
-                Ok(Err(err)) => Err(WalError::WriteWalError(format!(
-                    "failed to flush WAL: {err}"
-                ))),
-
-                Err(panic) => {
-                    let message = panic::downcast_str(&panic).unwrap_or("");
-                    let separator = if !message.is_empty() { ": " } else { "" };
-                    Err(WalError::WriteWalError(format!(
-                        "failed to flush WAL: flush task panicked{separator}{message}"
-                    )))
-                }
-            };
-
-            if let Err(err) = wal_flush_res {
-                log::error!("{err}");
-                segments.write().report_optimizer_error(err);
-                continue;
-            }
-
-            let confirmed_version = Self::flush_segments(segments.clone());
-            let confirmed_version = match confirmed_version {
-                Ok(version) => version,
-                Err(err) => {
-                    log::error!("Failed to flush: {err}");
-                    segments.write().report_optimizer_error(err);
-                    continue;
-                }
-            };
-
-            // Acknowledge confirmed version in WAL, but don't acknowledge the specified
-            // `keep_from` index or higher.
-            // This is to prevent truncating WAL entries that other bits of code still depend on
-            // such as the queue proxy shard.
-            // Default keep_from is `u64::MAX` to allow acknowledging all confirmed.
-            let keep_from = wal_keep_from.load(std::sync::atomic::Ordering::Relaxed);
-
-            // If we should keep the first message, do not acknowledge at all
-            if keep_from == 0 {
-                continue;
-            }
-
-            let ack = confirmed_version.min(keep_from.saturating_sub(1));
-
-            if let Err(err) = clocks.store_if_changed(&shard_path) {
-                log::warn!("Failed to store clock maps to disk: {err}");
-                segments.write().report_optimizer_error(err);
-            }
-
-            if let Err(err) = wal.blocking_lock().ack(ack) {
-                log::warn!("Failed to acknowledge WAL version: {err}");
-                segments.write().report_optimizer_error(err);
-            }
         }
     }
 
